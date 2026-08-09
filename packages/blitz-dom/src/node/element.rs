@@ -833,8 +833,14 @@ impl SvgImageData {
                     let scale = (300.0 / aspect_ratio).min(150.0);
                     (scale * aspect_ratio, scale)
                 } else {
-                    let size = self.tree.size();
-                    (size.width(), size.height())
+                    // No declared width, no declared height, no viewBox: the
+                    // element has no intrinsic dimensions at all, so CSS gives
+                    // it the default object size. usvg still reports a tree
+                    // size here -- 100x100 for an empty root -- but that is its
+                    // own default viewport, not an intrinsic size, and using it
+                    // silently produced a plausible 100x100 box instead of the
+                    // 300x150 every other dimensionless replaced element gets.
+                    (300.0, 150.0)
                 }
             }
         }
