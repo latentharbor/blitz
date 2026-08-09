@@ -176,6 +176,98 @@ impl crate::document::BaseDocument {
 
         style::thread_state::exit(ThreadState::LAYOUT);
     }
+
+    /// Compute the style of an element that the style traversal never reached,
+    /// which in practice means an element inside a `display: none` subtree.
+    ///
+    /// Stylo's traversal stops at a `display: none` element and actively
+    /// discards its descendants' style data (`recalc_style_at` calls
+    /// `clear_descendant_data`), because nothing below it generates a box.
+    /// That is right for painting and wrong for CSSOM: `getComputedStyle` is
+    /// still defined on those elements, and pages rely on it precisely because
+    /// reading style out of a `display: none` subtree does not force layout --
+    /// percentages stay percentages, since there is no containing block to
+    /// resolve them against. Without this, every longhand on every such
+    /// element reads as the empty string.
+    ///
+    /// Gecko answers those calls with `ResolveStyleLazily`. This is the same
+    /// thing on the same Stylo entry point, `style::traversal::resolve_style`,
+    /// which walks up to the nearest ancestor that does have a style and
+    /// cascades back down to `node_id`.
+    ///
+    /// The result is deliberately *not* stored on the element. Element style
+    /// data is what the traversal uses to decide what has already been styled;
+    /// writing a lazily-resolved style there would make a `display: none`
+    /// descendant look traversed and desynchronise the next restyle. Callers
+    /// that need it more than once should hold on to the returned `Arc`.
+    ///
+    /// Returns `None` for a non-element node, and for an element that already
+    /// has a primary style -- that case is not "no answer", it is "the caller
+    /// should read `primary_styles()`, which is authoritative".
+    pub fn resolve_style_lazily(&self, node_id: NodeId) -> Option<Arc<ComputedValues>> {
+        use style::context::ThreadLocalStyleContext;
+        use style::stylist::RuleInclusion;
+
+        let node = self.nodes.get(node_id)?;
+        let element = TNode::as_element(&node)?;
+
+        // Already styled: the traversal's answer wins over a lazy recompute.
+        if element.borrow_data().is_some_and(|d| d.has_styles()) {
+            return None;
+        }
+
+        // `resolve_style` cascades, and cascading asserts it runs in the
+        // layout thread state. This can be called straight from script (via
+        // getComputedStyle) with no traversal in progress, so enter the state
+        // if we are not already inside one -- re-entering it would panic.
+        let entered = !style::thread_state::get().contains(ThreadState::LAYOUT);
+        if entered {
+            style::thread_state::enter(ThreadState::LAYOUT);
+        }
+
+        let guard = &self.guard;
+        let guards = StylesheetGuards {
+            author: &guard.read(),
+            ua_or_user: &guard.read(),
+        };
+
+        let shared = SharedStyleContext {
+            traversal_flags: TraversalFlags::empty(),
+            stylist: &self.stylist,
+            options: GLOBAL_STYLE_DATA.options.clone(),
+            guards,
+            visited_styles_enabled: false,
+            animations: self.animations.clone(),
+            current_time_for_animations: 0.0,
+            snapshot_map: &self.snapshots,
+            registered_speculative_painters: &RegisteredPaintersImpl,
+        };
+
+        let mut thread_local = ThreadLocalStyleContext::new();
+        let mut context = StyleContext {
+            shared: &shared,
+            thread_local: &mut thread_local,
+        };
+
+        let styles = style::traversal::resolve_style(
+            &mut context,
+            element,
+            RuleInclusion::All,
+            None,
+            // No cache: the ancestors that still need resolving are only the
+            // ones between here and the `display: none` root, and that root is
+            // itself styled (the traversal stops *at* it, having computed it),
+            // so the walk is short.
+            None,
+        );
+        let primary = styles.primary().clone();
+
+        if entered {
+            style::thread_state::exit(ThreadState::LAYOUT);
+        }
+
+        Some(primary)
+    }
 }
 
 /// A handle to a node that Servo's style traits are implemented against
