@@ -1233,21 +1233,27 @@ impl<'a> TElement for BlitzNode<'a> {
             }
 
             // The `border` attribute maps to the four border widths as a
-            // pixel length. It is only these three elements: `embed`,
-            // `iframe`, `marquee` and non-image `input` all have a `border`
-            // attribute that must stay unmapped.
+            // pixel length, plus the four border styles as `solid` -- width
+            // alone would compute back to zero against the default
+            // border-style of `none`. It is only these three elements:
+            // `embed`, `iframe`, `marquee` and non-image `input` all have a
+            // `border` attribute that must stay unmapped.
             if *name == local_name!("border")
                 && (*tag == local_name!("img")
                     || *tag == local_name!("object")
                     || is_image_input)
             {
                 if let Some(px) = parse_pixel_length_attr(value) {
-                    use style::values::specified::BorderSideWidth;
+                    use style::values::specified::{BorderSideWidth, BorderStyle};
                     let width = BorderSideWidth::from_px(px);
                     push_style(PropertyDeclaration::BorderTopWidth(width.clone()));
                     push_style(PropertyDeclaration::BorderRightWidth(width.clone()));
                     push_style(PropertyDeclaration::BorderBottomWidth(width.clone()));
                     push_style(PropertyDeclaration::BorderLeftWidth(width));
+                    push_style(PropertyDeclaration::BorderTopStyle(BorderStyle::Solid));
+                    push_style(PropertyDeclaration::BorderRightStyle(BorderStyle::Solid));
+                    push_style(PropertyDeclaration::BorderBottomStyle(BorderStyle::Solid));
+                    push_style(PropertyDeclaration::BorderLeftStyle(BorderStyle::Solid));
                 }
             }
 
