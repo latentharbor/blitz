@@ -561,11 +561,21 @@ impl selectors::Element for BlitzNode<'_> {
         pe: &PseudoElement,
         _context: &mut MatchingContext<Self::Impl>,
     ) -> bool {
+        // `get_primary` rather than `primary`: a nested selector with a
+        // pseudo-element (e.g. `.a { &::before { .. } }`) can be matched
+        // against an element whose style data is allocated but whose primary
+        // style has not been computed yet. Such an element is a real DOM
+        // element mid-initial-styling, not a generated pseudo box, so "no
+        // pseudo" is the correct answer -- unwrapping panics.
         let pseudo = match self.stylo_element_data_opt().and_then(|s| s.get()) {
-            Some(el) => el.styles.primary().pseudo().or(match &self.data {
-                NodeData::AnonymousBlock(_) => Some(PseudoElement::ServoAnonymousBox),
-                _ => None,
-            }),
+            Some(el) => el
+                .styles
+                .get_primary()
+                .and_then(|primary| primary.pseudo())
+                .or(match &self.data {
+                    NodeData::AnonymousBlock(_) => Some(PseudoElement::ServoAnonymousBox),
+                    _ => None,
+                }),
             None => None,
         };
 
