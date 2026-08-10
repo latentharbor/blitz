@@ -181,7 +181,13 @@ pub fn display(input: stylo::Display) -> taffy::Display {
         // TODO: Support table layout in Taffy
         #[cfg(feature = "grid")]
         stylo::DisplayInside::Table => taffy::Display::Grid,
-        // Table-internal (row group, row, column, ...) and ruby display types
+        // Column boxes are never rendered: inside a table the grid consumes
+        // only the cells, and an orphaned display:table-column(-group) box
+        // outside any table generates no box at all (CSS 2.1 s17.2.1).
+        stylo::DisplayInside::TableColumn | stylo::DisplayInside::TableColumnGroup => {
+            taffy::Display::None
+        }
+        // Other table-internal (row group, row, ...) and ruby display types
         // have no dedicated Taffy layout mode. When such a box is not consumed
         // by table layout (an "orphaned" table-internal box), lay it out as a
         // block container. Falling through to `Display::DEFAULT` (flex) makes

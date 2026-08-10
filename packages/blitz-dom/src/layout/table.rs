@@ -213,10 +213,14 @@ pub(crate) fn collect_table_cells(
         | DisplayInside::TableHeaderGroup
         | DisplayInside::TableFooterGroup
         | DisplayInside::Contents => {
+            // Consume the group box itself, not its children: a cell child
+            // stays a real layout box whose own construction (inline text
+            // layout included) must still run. Removing the children's
+            // damage here left cells directly inside a row group (no
+            // intervening row) permanently empty.
+            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
             let children = std::mem::take(&mut doc.nodes[node_id].children);
             for child_id in children.iter().copied() {
-                doc.nodes[child_id]
-                    .remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                 collect_table_cells(
                     doc,
                     child_id,

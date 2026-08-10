@@ -571,36 +571,87 @@ pub(crate) fn collect_layout_children(
         // special data, not a TableRoot. Route it through the flow fallback
         // below instead.
         DisplayInside::Table if !container_is_replaced(doc, container_node_id) => {
-            let (table_context, tlayout_children) = build_table_context(doc, container_node_id);
-            #[allow(clippy::arc_with_non_send_sync)]
-            let data = SpecialElementData::TableRoot(Arc::new(table_context));
-            doc.nodes[container_node_id]
-                .flags
-                .insert(NodeFlags::IS_TABLE_ROOT);
-            doc.nodes[container_node_id]
-                .data
-                .downcast_element_mut()
-                .unwrap()
-                .special_data = data;
-            if let Some(before) = doc.nodes[container_node_id].before() {
-                out.push(before, doc);
-            }
-            out.extend(&tlayout_children, doc);
-            if let Some(after) = doc.nodes[container_node_id].after() {
-                out.push(after, doc);
-            }
+            collect_table_layout_children(doc, container_node_id, out);
         }
 
         // Table-internal (row group, row, column, ...) and ruby display types
         // that are not consumed by an enclosing table context, and replaced
-        // elements with display:table, are laid out as block containers (see
-        // `stylo_taffy::convert::display`). They must collect their layout
-        // children the same way: pushing raw children directly can leave a
-        // bare text node as the layout child of a Flex/Grid/Block container,
-        // which panics on `Node::style` during layout.
+        // elements with display:table, have no dedicated arm. An orphaned
+        // row/row-group that still contains table-internal children becomes
+        // the root of its own anonymous table (approximating CSS 2.1 s17.2.1
+        // fixup, which would wrap it in one); anything else is laid out as a
+        // block container (see `stylo_taffy::convert::display`) and must
+        // collect its layout children the flow way: pushing raw children
+        // directly can leave a bare text node as the layout child of a
+        // Flex/Grid/Block container, which panics on `Node::style` during
+        // layout.
         _ => {
-            collect_flow_layout_children(doc, container_node_id, out);
+            if orphan_forms_anonymous_table(doc, container_node_id, container_display) {
+                collect_table_layout_children(doc, container_node_id, out);
+            } else {
+                collect_flow_layout_children(doc, container_node_id, out);
+            }
         }
+    }
+}
+
+/// Whether an orphaned table-internal box (a row or row group with no
+/// enclosing table context) should be laid out as the root of an anonymous
+/// table: true when it has table-internal children for the table machinery to
+/// consume. A text-only orphan has nothing for a table grid to lay out (no
+/// anonymous cell generation yet) and renders better as a block container.
+fn orphan_forms_anonymous_table(
+    doc: &BaseDocument,
+    container_node_id: NodeId,
+    container_display: Display,
+) -> bool {
+    let is_row_or_row_group = matches!(
+        container_display.inside(),
+        DisplayInside::TableRowGroup
+            | DisplayInside::TableHeaderGroup
+            | DisplayInside::TableFooterGroup
+            | DisplayInside::TableRow
+    );
+    if !is_row_or_row_group {
+        return false;
+    }
+    doc.nodes[container_node_id]
+        .children
+        .iter()
+        .copied()
+        .map(|child_id| &doc.nodes[child_id])
+        .any(|child| {
+            child
+                .display_style()
+                .is_some_and(|display| display.outside() == DisplayOutside::InternalTable)
+        })
+}
+
+/// Collect layout children for a table root: build the table context (the
+/// cells become the layout children of a Taffy grid) and store it on the
+/// element.
+fn collect_table_layout_children(
+    doc: &mut BaseDocument,
+    container_node_id: NodeId,
+    out: &mut LayoutChildren,
+) {
+    let (table_context, tlayout_children) = build_table_context(doc, container_node_id);
+    #[allow(clippy::arc_with_non_send_sync)]
+    let data = SpecialElementData::TableRoot(Arc::new(table_context));
+    doc.nodes[container_node_id]
+        .flags
+        .insert(NodeFlags::IS_TABLE_ROOT);
+    doc.nodes[container_node_id]
+        .data
+        .downcast_element_mut()
+        .unwrap()
+        .special_data = data;
+    if let Some(before) = doc.nodes[container_node_id].before() {
+        out.push(before, doc);
+    }
+    out.extend(&tlayout_children, doc);
+    if let Some(after) = doc.nodes[container_node_id].after() {
+        out.push(after, doc);
     }
 }
 

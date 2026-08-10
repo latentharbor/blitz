@@ -567,6 +567,16 @@ impl BaseDocument {
             *node.display_constructed_as_mut() = display_constructed_as;
             // }
 
+            // A node that box construction made a table root is sized as a
+            // table item (shrink-to-fit) by its parent, whatever its computed
+            // display says. `to_taffy_style` can only derive this for
+            // display:table itself; an orphaned row/row-group forming an
+            // anonymous table (see `collect_table_layout_children`) keeps its
+            // internal display value.
+            if node.flags.is_table_root() {
+                node.style_mut().item_is_table = true;
+            }
+
             // In non-incremental mode we unconditionally clear the Taffy cache.
             // In incremental mode this is handled as part of damage propagation.
             if !incremental {
