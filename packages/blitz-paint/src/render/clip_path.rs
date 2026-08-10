@@ -86,13 +86,34 @@ impl ElementCx<'_, '_> {
         match shape {
             GenericBasicShape::Circle(circle) => {
                 let (cx, cy) = resolve_position(&circle.position, w, h, ox, oy);
-                let r = resolve_shape_radius(&circle.radius, w, h, cx - ox, cy - oy);
+                let r = resolve_shape_radius(
+                    &circle.radius,
+                    w,
+                    h,
+                    cx - ox,
+                    cy - oy,
+                    CornerMode::Circle,
+                );
                 Some(Circle::new(Point::new(cx, cy), r).into_path(0.1))
             }
             GenericBasicShape::Ellipse(ellipse) => {
                 let (cx, cy) = resolve_position(&ellipse.position, w, h, ox, oy);
-                let rx = resolve_shape_radius(&ellipse.semiaxis_x, w, h, cx - ox, cy - oy);
-                let ry = resolve_shape_radius(&ellipse.semiaxis_y, h, w, cy - oy, cx - ox);
+                let rx = resolve_shape_radius(
+                    &ellipse.semiaxis_x,
+                    w,
+                    h,
+                    cx - ox,
+                    cy - oy,
+                    CornerMode::Ellipse,
+                );
+                let ry = resolve_shape_radius(
+                    &ellipse.semiaxis_y,
+                    h,
+                    w,
+                    cy - oy,
+                    cx - ox,
+                    CornerMode::Ellipse,
+                );
                 Some(Ellipse::new(Point::new(cx, cy), (rx, ry), 0.0).into_path(0.1))
             }
             GenericBasicShape::Polygon(polygon) => {
@@ -214,6 +235,17 @@ fn resolve_position(
     }
 }
 
+/// How the corner keywords (`closest-corner` / `farthest-corner`) resolve for
+/// this call: a circle's radius is the euclidean distance from the center to
+/// the corner, while an ellipse's semi-axis is the per-axis side distance
+/// scaled by sqrt(2) (the ellipse with the same aspect ratio as the side
+/// distances that passes through the corner, css-shapes-1 §3.1.1).
+#[derive(Clone, Copy, PartialEq)]
+enum CornerMode {
+    Circle,
+    Ellipse,
+}
+
 /// Resolve a shape radius keyword or length value
 fn resolve_shape_radius(
     radius: &GenericShapeRadius<LengthPercentage>,
@@ -221,21 +253,31 @@ fn resolve_shape_radius(
     secondary_size: f64,
     center_offset_primary: f64,
     center_offset_secondary: f64,
+    corner_mode: CornerMode,
 ) -> f64 {
+    // Signed distances from the center to each pair of box edges. The signed
+    // min/max pick the closest/farthest edge even when the center lies
+    // outside the reference box (`|min| <= |max|` always holds), so only the
+    // absolute value is meaningful as a distance.
+    let closest_primary = center_offset_primary.min(primary_size - center_offset_primary);
+    let farthest_primary = center_offset_primary.max(primary_size - center_offset_primary);
+    let closest_secondary = center_offset_secondary.min(secondary_size - center_offset_secondary);
+    let farthest_secondary = center_offset_secondary.max(secondary_size - center_offset_secondary);
+
     match radius {
         GenericShapeRadius::Length(lp) => resolve_lp(&lp.0, primary_size),
-        GenericShapeRadius::ClosestSide => center_offset_primary
-            .min(primary_size - center_offset_primary)
-            .min(center_offset_secondary)
-            .min(secondary_size - center_offset_secondary)
-            .max(0.0),
-        GenericShapeRadius::FarthestSide => center_offset_primary
-            .max(primary_size - center_offset_primary)
-            .max(center_offset_secondary)
-            .max(secondary_size - center_offset_secondary),
-
-        GenericShapeRadius::FarthestCorner => todo!(),
-        GenericShapeRadius::ClosestCorner => todo!(),
+        GenericShapeRadius::ClosestSide => {
+            closest_primary.min(closest_secondary).max(0.0)
+        }
+        GenericShapeRadius::FarthestSide => farthest_primary.max(farthest_secondary),
+        GenericShapeRadius::ClosestCorner => match corner_mode {
+            CornerMode::Circle => closest_primary.hypot(closest_secondary),
+            CornerMode::Ellipse => closest_primary.abs() * std::f64::consts::SQRT_2,
+        },
+        GenericShapeRadius::FarthestCorner => match corner_mode {
+            CornerMode::Circle => farthest_primary.hypot(farthest_secondary),
+            CornerMode::Ellipse => farthest_primary.abs() * std::f64::consts::SQRT_2,
+        },
     }
 }
 
