@@ -725,6 +725,23 @@ li {
 }
 
 
+/* forms: fieldset and legend (HTML rendering spec s15.3.13) */
+
+fieldset {
+    display: block;
+    margin-inline: 2px;
+    border: 2px groove ThreeDFace;
+    padding-block: 0.35em 0.625em;
+    padding-inline: 0.75em;
+    min-inline-size: min-content;
+}
+
+legend {
+    display: block;
+    padding-inline: 2px;
+}
+
+
 /* leafs */
 
 /* <hr> noshade and color attributes are handled completely by
