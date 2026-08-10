@@ -198,6 +198,19 @@ impl ServoStylesheetLoader for StylesheetLoader {
             }));
         }
 
+        // An empty or unresolvable `@import url()` has no URL to fetch: per
+        // css-values-4 §5.4 (empty URLs) it points at an invalid resource and
+        // must not trigger a request. Refuse it instead of unwrapping.
+        if url.url().is_none() {
+            return ServoArc::new(lock.wrap(ImportRule {
+                url,
+                stylesheet: ImportSheet::new_refused(),
+                supports,
+                layer,
+                source_location: location,
+            }));
+        }
+
         let import = ImportRule {
             url,
             stylesheet: ImportSheet::new_pending(),
