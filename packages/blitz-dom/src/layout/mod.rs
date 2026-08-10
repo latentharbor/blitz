@@ -238,7 +238,12 @@ impl BaseDocument {
                         // width/height attributes, defaulting to 300x150. Other replaced
                         // elements without intrinsic dimensions (video, iframe, embed) use
                         // the 300x150 default object size but have no intrinsic ratio.
-                        SpecialElementData::Canvas(_) | SpecialElementData::None => {
+                        // SubDocument: an <iframe> hosting an embedded
+                        // document is still sized like an iframe without one
+                        // (default object size, no intrinsic ratio).
+                        SpecialElementData::Canvas(_)
+                        | SpecialElementData::SubDocument(_)
+                        | SpecialElementData::None => {
                             let tag_name = &element_data.name.local;
                             if *tag_name == local_name!("img") || *tag_name == local_name!("svg") {
                                 (taffy::Size::ZERO, None)

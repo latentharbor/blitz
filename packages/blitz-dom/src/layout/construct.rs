@@ -202,8 +202,22 @@ fn push_hoisted_children_and_pseudos(
     container_node_id: NodeId,
     out: &mut LayoutChildren,
 ) {
+    // A ::before/::after pseudo with display:contents is transparent for box
+    // generation just like a contents child: hoist through it rather than
+    // pushing the pseudo node (whose bare text content cannot be a layout
+    // child) as a box.
+    fn push_hoisted(doc: &mut BaseDocument, node_id: NodeId, out: &mut LayoutChildren) {
+        let node = &doc.nodes[node_id];
+        let display = node.display_style().unwrap_or(Display::inline());
+        if matches!(display.inside(), DisplayInside::Contents) {
+            collect_layout_children(doc, node_id, out);
+        } else {
+            out.push(node_id, doc);
+        }
+    }
+
     if let Some(before) = doc.nodes[container_node_id].before() {
-        out.push(before, doc);
+        push_hoisted(doc, before, out);
     }
     // Take children array from node to avoid borrow checker issues.
     let children = std::mem::take(&mut doc.nodes[container_node_id].children);
@@ -212,16 +226,11 @@ fn push_hoisted_children_and_pseudos(
         if child.data.kind() == NodeKind::Comment || child.is_whitespace_node() {
             continue;
         }
-        let child_display = child.display_style().unwrap_or(Display::inline());
-        if matches!(child_display.inside(), DisplayInside::Contents) {
-            collect_layout_children(doc, child_id, out);
-        } else {
-            out.push(child_id, doc);
-        }
+        push_hoisted(doc, child_id, out);
     }
     doc.nodes[container_node_id].children = children;
     if let Some(after) = doc.nodes[container_node_id].after() {
-        out.push(after, doc);
+        push_hoisted(doc, after, out);
     }
 }
 
@@ -267,6 +276,32 @@ impl Default for FlowClassification {
     }
 }
 
+/// Classify a ::before/::after pseudo-element for inline-vs-block layout, but
+/// only when it has `display: contents`: such a pseudo is transparent for box
+/// generation and hoists its content (typically a bare text node) into the
+/// container's formatting context, so the content must vote in the
+/// classification or the container can miss that it needs an inline
+/// formatting context. Pseudos with other display values keep today's
+/// behavior of not voting.
+fn classify_contents_pseudo(
+    doc: &BaseDocument,
+    pseudo_id: Option<NodeId>,
+    classification: &mut FlowClassification,
+) {
+    let Some(pseudo_id) = pseudo_id else { return };
+    let pseudo = &doc.nodes[pseudo_id];
+    let display = pseudo
+        .primary_styles()
+        .map(|s| s.clone_display())
+        .unwrap_or(Display::inline());
+    if matches!(display.inside(), DisplayInside::Contents) {
+        // The pseudo node itself casts no vote (it generates no box);
+        // its children decide, exactly like a display:contents child.
+        classification.has_contents = true;
+        classify_flow_children(doc, &pseudo.children, classification);
+    }
+}
+
 /// Classify `children` for inline-vs-block layout, recursing transparently
 /// through display:contents nodes (whose children participate in the
 /// container's formatting context).
@@ -307,6 +342,16 @@ fn classify_flow_children(
 
             // Ignore nodes that are entirely whitespace
             if child.is_whitespace_node() {
+                continue;
+            }
+
+            // display:none children generate no boxes and must not vote
+            // either: with e.g. `html { display: none }` the document node's
+            // only child would otherwise leave `all_inline` set, turning the
+            // document itself into an inline root -- and the document node
+            // cannot carry an inline layout (the deferred construction step
+            // panics unwrapping its element data).
+            if matches!(display.outside(), DisplayOutside::None) {
                 continue;
             }
 
@@ -476,74 +521,21 @@ pub(crate) fn collect_layout_children(
             push_hoisted_children_and_pseudos(doc, container_node_id, out);
         }
         DisplayInside::Flow | DisplayInside::FlowRoot | DisplayInside::TableCell => {
-            // display:contents children are transparent for box generation:
-            // their children participate in this container's formatting
-            // context, so classification must recurse into them.
-            let mut classification = FlowClassification::default();
-            classify_flow_children(
-                doc,
-                &doc.nodes[container_node_id].children,
-                &mut classification,
-            );
-
-            if classification.all_out_of_flow {
-                // Contents-transparent: a display:contents child may be
-                // holding the out-of-flow elements (otherwise the contents
-                // node itself would be pushed as a layout box).
-                return push_hoisted_children_and_pseudos(doc, container_node_id, out);
-            }
-
-            // TODO: fix display:contents
-            if classification.all_inline {
-                let existing_layout = doc.nodes[container_node_id]
-                    .element_data_mut()
-                    .and_then(|el| el.inline_layout_data.take());
-                let layout = existing_layout.unwrap_or_else(|| Box::new(TextLayout::new()));
-
-                // Queue node for inline layout construction. Deferring construction of inline layouts to a
-                // dedicated phase allows us to multithread the expensive text shaping step.
-                doc.deferred_construction_nodes.push(ConstructionTask {
-                    node_id: container_node_id,
-                    data: ConstructionTaskData::InlineLayout(layout),
-                });
-                doc.nodes[container_node_id]
-                    .flags
-                    .insert(NodeFlags::IS_INLINE_ROOT);
-
-                find_inline_layout_embedded_boxes(doc, container_node_id, &mut out.children);
-                return;
-            }
-
-            // If the children are either all inline or all block then simply return the regular children
-            // as the layout children
-            if classification.all_block & !classification.has_contents {
-                return push_non_whitespace_children_and_pseudos(
-                    &mut out.children,
-                    &doc.nodes[container_node_id],
-                );
-            } else if classification.all_inline & !classification.has_contents {
-                return push_children_and_pseudos(&mut out.children, &doc.nodes[container_node_id]);
-            }
-
-            fn block_item_needs_wrap(
-                child_node_kind: NodeKind,
-                display_outside: DisplayOutside,
-            ) -> bool {
-                child_node_kind == NodeKind::Text || display_outside == DisplayOutside::Inline
-            }
-            collect_complex_layout_children(
-                doc,
-                container_node_id,
-                out,
-                false,
-                block_item_needs_wrap,
-            );
+            collect_flow_layout_children(doc, container_node_id, out);
         }
         DisplayInside::Flex | DisplayInside::Grid => {
-            let has_text_node_or_contents = doc.nodes[container_node_id]
+            // ::before/::after pseudos must be considered too: a pseudo with
+            // `display: contents` (e.g. `.flex::before { display: contents;
+            // content: "A" }`) hoists a bare text node into the flex
+            // container, which needs the anonymous-block wrapping of the
+            // complex path just like a regular contents child.
+            let container = &doc.nodes[container_node_id];
+            let has_text_node_or_contents = container
                 .children
                 .iter()
                 .copied()
+                .chain(container.before())
+                .chain(container.after())
                 .map(|child_id| &doc.nodes[child_id])
                 .any(|child| {
                     let display = child.display_style().unwrap_or(Display::inline());
@@ -573,7 +565,12 @@ pub(crate) fn collect_layout_children(
             );
         }
 
-        DisplayInside::Table => {
+        // A replaced element (e.g. <canvas>) with display:table still
+        // generates a replaced box, not a table wrapper box: layout consumes
+        // it through the replaced path, which expects the element's usual
+        // special data, not a TableRoot. Route it through the flow fallback
+        // below instead.
+        DisplayInside::Table if !container_is_replaced(doc, container_node_id) => {
             let (table_context, tlayout_children) = build_table_context(doc, container_node_id);
             #[allow(clippy::arc_with_non_send_sync)]
             let data = SpecialElementData::TableRoot(Arc::new(table_context));
@@ -594,13 +591,99 @@ pub(crate) fn collect_layout_children(
             }
         }
 
+        // Table-internal (row group, row, column, ...) and ruby display types
+        // that are not consumed by an enclosing table context, and replaced
+        // elements with display:table, are laid out as block containers (see
+        // `stylo_taffy::convert::display`). They must collect their layout
+        // children the same way: pushing raw children directly can leave a
+        // bare text node as the layout child of a Flex/Grid/Block container,
+        // which panics on `Node::style` during layout.
         _ => {
-            push_non_whitespace_children_and_pseudos(
-                &mut out.children,
-                &doc.nodes[container_node_id],
-            );
+            collect_flow_layout_children(doc, container_node_id, out);
         }
     }
+}
+
+/// Whether the container node is a replaced element (its box's content is
+/// replaced, so its DOM children never generate layout boxes of their own).
+fn container_is_replaced(doc: &BaseDocument, container_node_id: NodeId) -> bool {
+    doc.nodes[container_node_id]
+        .data
+        .downcast_element()
+        .is_some_and(|el| is_replaced_element(&el.name.local))
+}
+
+/// Collect layout children for a block container (`display: flow` /
+/// `flow-root` / `table-cell`, and the blockified fallback for orphaned
+/// table-internal and ruby display types).
+fn collect_flow_layout_children(
+    doc: &mut BaseDocument,
+    container_node_id: NodeId,
+    out: &mut LayoutChildren,
+) {
+    // display:contents children are transparent for box generation:
+    // their children participate in this container's formatting
+    // context, so classification must recurse into them.
+    let mut classification = FlowClassification::default();
+    classify_contents_pseudo(
+        doc,
+        doc.nodes[container_node_id].before(),
+        &mut classification,
+    );
+    classify_flow_children(
+        doc,
+        &doc.nodes[container_node_id].children,
+        &mut classification,
+    );
+    classify_contents_pseudo(
+        doc,
+        doc.nodes[container_node_id].after(),
+        &mut classification,
+    );
+
+    if classification.all_out_of_flow {
+        // Contents-transparent: a display:contents child may be
+        // holding the out-of-flow elements (otherwise the contents
+        // node itself would be pushed as a layout box).
+        return push_hoisted_children_and_pseudos(doc, container_node_id, out);
+    }
+
+    // TODO: fix display:contents
+    if classification.all_inline {
+        let existing_layout = doc.nodes[container_node_id]
+            .element_data_mut()
+            .and_then(|el| el.inline_layout_data.take());
+        let layout = existing_layout.unwrap_or_else(|| Box::new(TextLayout::new()));
+
+        // Queue node for inline layout construction. Deferring construction of inline layouts to a
+        // dedicated phase allows us to multithread the expensive text shaping step.
+        doc.deferred_construction_nodes.push(ConstructionTask {
+            node_id: container_node_id,
+            data: ConstructionTaskData::InlineLayout(layout),
+        });
+        doc.nodes[container_node_id]
+            .flags
+            .insert(NodeFlags::IS_INLINE_ROOT);
+
+        find_inline_layout_embedded_boxes(doc, container_node_id, &mut out.children);
+        return;
+    }
+
+    // If the children are either all inline or all block then simply return the regular children
+    // as the layout children
+    if classification.all_block & !classification.has_contents {
+        return push_non_whitespace_children_and_pseudos(
+            &mut out.children,
+            &doc.nodes[container_node_id],
+        );
+    } else if classification.all_inline & !classification.has_contents {
+        return push_children_and_pseudos(&mut out.children, &doc.nodes[container_node_id]);
+    }
+
+    fn block_item_needs_wrap(child_node_kind: NodeKind, display_outside: DisplayOutside) -> bool {
+        child_node_kind == NodeKind::Text || display_outside == DisplayOutside::Inline
+    }
+    collect_complex_layout_children(doc, container_node_id, out, false, block_item_needs_wrap);
 }
 
 /// Extract the text generated by a pseudo-element's `content` property
