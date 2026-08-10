@@ -181,10 +181,16 @@ pub fn display(input: stylo::Display) -> taffy::Display {
         // TODO: Support table layout in Taffy
         #[cfg(feature = "grid")]
         stylo::DisplayInside::Table => taffy::Display::Grid,
-        _ => {
-            // println!("FALLBACK {:?} {:?}", input.inside(), input.outside());
-            taffy::Display::DEFAULT
-        }
+        // Table-internal (row group, row, column, ...) and ruby display types
+        // have no dedicated Taffy layout mode. When such a box is not consumed
+        // by table layout (an "orphaned" table-internal box), lay it out as a
+        // block container. Falling through to `Display::DEFAULT` (flex) makes
+        // Taffy's flexbox iterate the node's raw children, which can include
+        // bare text nodes and panics on `Node::style`.
+        #[cfg(feature = "block")]
+        _ => taffy::Display::Block,
+        #[cfg(not(feature = "block"))]
+        _ => taffy::Display::DEFAULT,
     };
 
     match input.outside() {
