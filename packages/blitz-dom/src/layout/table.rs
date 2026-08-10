@@ -298,6 +298,10 @@ pub(crate) fn collect_table_cells(
                         }
                     }
                     taffy::CompactLength::AUTO_TAG => style_helpers::auto(),
+                    // A calc() width cannot be resolved to a static column
+                    // hint here (the percentage basis is not known yet), so
+                    // let content-based track sizing decide, like `auto`.
+                    _ if style.size.width.into_raw().is_calc() => style_helpers::auto(),
                     _ => unreachable!(),
                 };
                 columns.push(column);
