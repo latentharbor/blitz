@@ -69,6 +69,7 @@ impl Drop for DocumentMutator<'_> {
     fn drop(&mut self) {
         self.flush(); // Defined at bottom of file
         if self.mutations_occurred {
+            self.doc.set_needs_resolve();
             self.doc.shell_provider.request_redraw();
         }
     }
@@ -1070,6 +1071,7 @@ impl Drop for ViewportMut<'_> {
             return;
         }
 
+        self.doc.set_needs_resolve();
         self.doc.set_stylist_device(make_device(
             &self.doc.viewport,
             self.doc.media_type.clone(),

@@ -104,6 +104,12 @@ impl BaseDocument {
             timer.record_time("c_damage");
         }
 
+        // The resolved tree now reflects every mutation seen so far. Cleared
+        // *before* `refresh_hover` below on purpose: a hover change re-marks
+        // the document through `snapshot_node`, exactly like the restyle
+        // hints it must leave for the next pass.
+        self.needs_resolve = false;
+
         // Re-resolve the hover node from the pointer position against the fresh
         // layout. This must run *after* the damage/dirty flags are cleared
         // above, so that the restyle hint and ancestor `dirty_descendants`

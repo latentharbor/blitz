@@ -200,6 +200,15 @@ pub struct BaseDocument {
     pub(crate) style_threading: StyleThreading,
     /// Whether incremental layout is enabled for this document.
     pub(crate) incremental_layout: bool,
+    /// Whether anything since the last completed [`Self::resolve`] may have
+    /// changed style, layout, or interaction state. Starts `true`; cleared at
+    /// the end of `resolve`; re-set by every mutation entry point (see
+    /// [`Self::set_needs_resolve`]). Read through [`Self::needs_resolve`],
+    /// which callers can use to skip a whole style/layout pass when nothing
+    /// changed — a read-heavy page can call `getComputedStyle` tens of
+    /// thousands of times between mutations, and without this every one of
+    /// those reads pays a full-document resolve.
+    pub(crate) needs_resolve: bool,
 
     // Events
     pub(crate) tx: Sender<DocumentEvent>,
@@ -443,6 +452,7 @@ impl BaseDocument {
             media_type,
             style_threading: config.style_threading,
             incremental_layout: config.incremental.unwrap_or(true),
+            needs_resolve: true,
             devtool_settings: DevtoolSettings::default(),
             viewport_scroll: crate::Point::ZERO,
             url: base_url,
@@ -603,6 +613,11 @@ impl BaseDocument {
         event: &mut DomEvent,
         dispatch_event: F,
     ) {
+        // Conservative: most event handling that changes anything also goes
+        // through `snapshot_node` or the mutator, but text-input editing
+        // writes into element data directly. One spurious resolve per event
+        // is noise; a missed one is a stale layout.
+        self.set_needs_resolve();
         handle_dom_event(self, event, dispatch_event)
     }
 
@@ -1077,6 +1092,7 @@ impl BaseDocument {
 
     pub fn remove_user_agent_stylesheet(&mut self, contents: &str) {
         if let Some(sheet) = self.ua_stylesheets.remove(contents) {
+            self.set_needs_resolve();
             self.stylist.remove_stylesheet(sheet, &self.guard.read());
         }
     }
@@ -1098,6 +1114,7 @@ impl BaseDocument {
     }
 
     pub fn add_user_agent_stylesheet(&mut self, css: &str) {
+        self.set_needs_resolve();
         let sheet = self.make_stylesheet(css, Origin::UserAgent);
         self.ua_stylesheets.insert(css.to_string(), sheet.clone());
         self.stylist.append_stylesheet(sheet, &self.guard.read());
@@ -1132,6 +1149,7 @@ impl BaseDocument {
     }
 
     pub fn add_stylesheet_for_node(&mut self, stylesheet: DocumentStyleSheet, node_id: NodeId) {
+        self.set_needs_resolve();
         let old = self.nodes_to_stylesheet.insert(node_id, stylesheet.clone());
 
         if let Some(old) = old {
@@ -1198,6 +1216,10 @@ impl BaseDocument {
     }
 
     pub fn load_resource(&mut self, res: ResourceLoadResponse) {
+        // Even a failed load is marked: delivery is the only signal that the
+        // set of pending resources changed, and a spurious resolve is cheap
+        // while a missed one is a stale answer.
+        self.set_needs_resolve();
         self.pending_critical_resources.remove(&res.request_id);
 
         let resource = match res.result {
@@ -1344,6 +1366,10 @@ impl BaseDocument {
     }
 
     pub fn snapshot_node(&mut self, node_id: NodeId) {
+        // A snapshot is taken exactly when an element's selector-visible
+        // state is about to change (attributes, focus/hover/active flags),
+        // which makes this the choke point for interaction-state dirtiness.
+        self.set_needs_resolve();
         let node = &mut self.nodes[node_id];
 
         // Do not snapshot nodes that have never been styled. A snapshot records an element's
@@ -1749,6 +1775,7 @@ impl BaseDocument {
     }
 
     pub fn set_viewport(&mut self, viewport: Viewport) {
+        self.set_needs_resolve();
         let scale_has_changed = viewport.scale_f64() != self.viewport.scale_f64();
         self.viewport = viewport;
         self.set_stylist_device(make_device(
@@ -1775,6 +1802,7 @@ impl BaseDocument {
         if self.media_type == media_type {
             return;
         }
+        self.set_needs_resolve();
         self.media_type = media_type;
         self.set_stylist_device(make_device(
             &self.viewport,
@@ -1813,6 +1841,39 @@ impl BaseDocument {
     /// Enables or disables incremental layout for this document.
     pub fn set_incremental_layout(&mut self, enabled: bool) {
         self.incremental_layout = enabled;
+    }
+
+    /// Whether a [`Self::resolve`] call could change any style, layout, or
+    /// interaction state — `false` means the resolved tree is exactly what
+    /// the last `resolve` left, and a caller that re-reads it (computed
+    /// styles, geometry) may skip the pass entirely.
+    ///
+    /// Two caveats, both deliberate:
+    /// - Time is not an input here. A caller that advances
+    ///   `current_time_for_animations` between resolves must not use this to
+    ///   skip while `is_animating()` — animated styles are a function of the
+    ///   time it passes, which this flag knows nothing about. Callers that
+    ///   resolve at a frozen time (as the OpenKitesurf engine does) get
+    ///   identical styles from a repeated resolve, so skipping is exact.
+    /// - Pending resource messages are not an input either: delivery is what
+    ///   marks the document dirty, so drain [`Self::handle_messages`] first.
+    ///
+    /// Sub-documents track their own flag and are resolved from the parent's
+    /// pass, so a document that has any is conservatively always dirty rather
+    /// than recursively polled.
+    pub fn needs_resolve(&self) -> bool {
+        self.needs_resolve
+            || !self.sub_document_nodes.is_empty()
+            || !matches!(self.scroll_animation, ScrollAnimationState::None)
+    }
+
+    /// Mark the document as needing a [`Self::resolve`] pass. Every mutation
+    /// entry point calls this (tree/attribute/text mutation via
+    /// `DocumentMutator`, stylesheet registration, resource delivery,
+    /// viewport/media changes, scrolling, and interaction-state snapshots);
+    /// external callers only need it for mutations that bypass all of those.
+    pub fn set_needs_resolve(&mut self) {
+        self.needs_resolve = true;
     }
 
     pub fn devtools(&self) -> &DevtoolSettings {
@@ -1967,6 +2028,11 @@ impl BaseDocument {
         y: f64,
         mut dispatch_event: F,
     ) -> bool {
+        // Per-node scrolls move content under a stationary pointer just like
+        // viewport scrolls do, so hover may need re-resolving. Marked up
+        // front rather than on change because the bubbling below already
+        // marks the changed cases; this covers the node's own offset.
+        self.set_needs_resolve();
         // Per the CSS overflow propagation rules, the root element's overflow (and usually
         // the <body>'s) is applied to the viewport, and the element itself must not have
         // a scrolling mechanism of its own. So scrolls that reach the root element are
@@ -2146,7 +2212,14 @@ impl BaseDocument {
         self.viewport_scroll.y =
             f64::max(0.0, f64::min(new_scroll.1, content_height - window_height));
 
-        self.viewport_scroll != initial
+        let changed = self.viewport_scroll != initial;
+        if changed {
+            // Scrolling moves the pointer relative to the content, so hover
+            // state (resolved by `refresh_hover` inside the next pass) may
+            // change even though no node was mutated.
+            self.set_needs_resolve();
+        }
+        changed
     }
 
     pub fn scroll_by(
@@ -2168,6 +2241,7 @@ impl BaseDocument {
     }
 
     pub fn set_viewport_scroll(&mut self, scroll: crate::Point<f64>) {
+        self.set_needs_resolve();
         self.viewport_scroll = scroll;
     }
 
